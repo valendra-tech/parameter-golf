@@ -1,0 +1,22 @@
+{
+  "track": "10min_16mb",
+  "date": "2026-04-29",
+  "name": "DualPathMambaLite",
+  "author": "jose",
+  "status": "untrained_pending_cuda_run",
+  "base": "2026-03-19_SlidingWindow_FP16Emb_10L_MuonWD_OvertoneInit",
+  "defaults": {
+    "num_layers": 10,
+    "model_dim": 512,
+    "mamba_dim": 64,
+    "mamba_layers": 1,
+    "mamba_mixer": "triton_conv1d",
+    "mamba_conv_kernel": 7,
+    "use_mamba_path": true
+  },
+  "artifact_limit_bytes": 16000000,
+  "estimated_artifact_bytes": 15900000,
+  "val_loss": null,
+  "val_bpb": null,
+  "result": null
+}
