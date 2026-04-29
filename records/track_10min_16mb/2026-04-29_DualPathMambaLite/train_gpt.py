@@ -27,6 +27,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except Exception:
+    HAS_TRITON = False
+
 ARTIFACT_LIMIT_BYTES = 16_000_000
 DUAL_MAMBA_DEFAULT_ARTIFACT_ESTIMATE_BYTES = 15_900_000
 
@@ -77,9 +84,10 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     use_mamba_path = bool(int(os.environ.get("USE_MAMBA_PATH", "1")))
-    mamba_dim = int(os.environ.get("MAMBA_DIM", 112))
-    mamba_layers = int(os.environ.get("MAMBA_LAYERS", 3))
+    mamba_dim = int(os.environ.get("MAMBA_DIM", 64))
+    mamba_layers = int(os.environ.get("MAMBA_LAYERS", 1))
     mamba_conv_kernel = int(os.environ.get("MAMBA_CONV_KERNEL", 7))
+    mamba_mixer = os.environ.get("MAMBA_MIXER", "triton_conv1d")
     mamba_gate_init = float(os.environ.get("MAMBA_GATE_INIT", -3.0))
     enforce_artifact_budget = bool(int(os.environ.get("ENFORCE_ARTIFACT_BUDGET", "1")))
 
@@ -652,10 +660,63 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+if HAS_TRITON:
+    @triton.jit
+    def _causal_dwconv_fwd(xp, wp, bp, yp, n: tl.constexpr, t: tl.constexpr, d: tl.constexpr, ksz: tl.constexpr, bd: tl.constexpr, bm: tl.constexpr):
+        pid_m = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        offs_m = pid_m * bm + tl.arange(0, bm)
+        offs_d = pid_d * bd + tl.arange(0, bd)
+        bb = offs_m // t
+        tt = offs_m - bb * t
+        mask = (offs_m[:, None] < n) & (offs_d[None, :] < d)
+        acc = tl.load(bp + offs_d, mask=offs_d < d, other=0.0)[None, :]
+        for kk in range(ksz):
+            src_t = tt + kk - ksz + 1
+            x = tl.load(xp + (bb[:, None] * t + src_t[:, None]) * d + offs_d[None, :], mask=mask & (src_t[:, None] >= 0), other=0.0)
+            w = tl.load(wp + offs_d * ksz + kk, mask=offs_d < d, other=0.0)
+            acc += x * w[None, :]
+        tl.store(yp + offs_m[:, None] * d + offs_d[None, :], acc, mask=mask)
+
+
+class TritonCausalDepthwiseConv1d(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, weight: Tensor, bias: Tensor, conv_kernel: int) -> Tensor:
+        x = x.contiguous()
+        weight = weight.contiguous()
+        bias = bias.contiguous()
+        bsz, seqlen, dim = x.shape
+        y = torch.empty_like(x)
+        _causal_dwconv_fwd[(triton.cdiv(bsz * seqlen, 64), triton.cdiv(dim, 32))](x, weight, bias, y, bsz * seqlen, seqlen, dim, conv_kernel, bd=32, bm=64)
+        ctx.save_for_backward(x, weight)
+        ctx.conv_kernel = conv_kernel
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y: Tensor):
+        x, weight = ctx.saved_tensors
+        ksz = ctx.conv_kernel
+        bsz, seqlen, dim = x.shape
+        gy_t = grad_y.transpose(1, 2).contiguous()
+        gy_full = F.pad(gy_t, (0, ksz - 1))
+        x_t = x.transpose(1, 2).contiguous()
+        dx = torch.nn.grad.conv1d_input(x_t.shape, weight, gy_full, padding=ksz - 1, groups=dim).transpose(1, 2)
+        dw = torch.nn.grad.conv1d_weight(x_t, weight.shape, gy_full, padding=ksz - 1, groups=dim)
+        db = grad_y.sum(dim=(0, 1))
+        return dx, dw, db, None
+
+
+def causal_depthwise_conv1d(x: Tensor, weight: Tensor, bias: Tensor, conv_kernel: int, use_triton: bool) -> Tensor:
+    if use_triton and HAS_TRITON and x.is_cuda:
+        return TritonCausalDepthwiseConv1d.apply(x, weight, bias, conv_kernel)
+    conv_in = x.transpose(1, 2)
+    return F.conv1d(conv_in, weight.to(dtype=x.dtype), bias.to(dtype=x.dtype), padding=conv_kernel - 1, groups=x.size(-1))[:, :, : x.size(1)].transpose(1, 2)
+
+
 class MambaLiteBlock(nn.Module):
     # Compact Mamba-inspired block: gated input projection, causal depthwise conv,
     # and zero-init output projection so it can be added to a trained GPT recipe.
-    def __init__(self, dim: int, conv_kernel: int):
+    def __init__(self, dim: int, conv_kernel: int, use_triton: bool):
         super().__init__()
         if conv_kernel <= 0:
             raise ValueError(f"conv_kernel must be positive, got {conv_kernel}")
@@ -667,19 +728,12 @@ class MambaLiteBlock(nn.Module):
         self.out_proj._zero_init = True
         self.conv_mix = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
         self.resid_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.use_triton = use_triton
 
     def forward(self, x: Tensor) -> Tensor:
-        bsz, seqlen, dim = x.shape
         u, gate = self.in_proj(self.norm(x)).chunk(2, dim=-1)
         u = F.silu(u)
-        conv_in = u.transpose(1, 2)
-        conv_out = F.conv1d(
-            conv_in,
-            self.conv.weight.to(dtype=u.dtype),
-            self.conv.bias.to(dtype=u.dtype) if self.conv.bias is not None else None,
-            padding=self.conv_kernel - 1,
-            groups=dim,
-        )[:, :, :seqlen].transpose(1, 2)
+        conv_out = causal_depthwise_conv1d(u, self.conv.weight.to(dtype=u.dtype), self.conv.bias.to(dtype=u.dtype), self.conv_kernel, self.use_triton)
         mix = torch.sigmoid(self.conv_mix).to(dtype=u.dtype)[None, None, :]
         y = u + mix * conv_out
         y = y * torch.sigmoid(gate)
@@ -687,14 +741,20 @@ class MambaLiteBlock(nn.Module):
 
 
 class MambaLiteBranch(nn.Module):
-    def __init__(self, model_dim: int, mamba_dim: int, num_layers: int, conv_kernel: int):
+    def __init__(self, model_dim: int, mamba_dim: int, num_layers: int, conv_kernel: int, mixer: str):
         super().__init__()
         if mamba_dim <= 0:
             raise ValueError(f"mamba_dim must be positive, got {mamba_dim}")
         if num_layers <= 0:
             raise ValueError(f"mamba_layers must be positive, got {num_layers}")
+        if mixer == "conv1d":
+            block_cls = lambda: MambaLiteBlock(mamba_dim, conv_kernel, False)
+        elif mixer == "triton_conv1d":
+            block_cls = lambda: MambaLiteBlock(mamba_dim, conv_kernel, True)
+        else:
+            raise ValueError(f"Unsupported MAMBA_MIXER={mixer!r}; expected conv1d or triton_conv1d")
         self.in_proj = CastedLinear(model_dim, mamba_dim, bias=False)
-        self.blocks = nn.ModuleList([MambaLiteBlock(mamba_dim, conv_kernel) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([block_cls() for _ in range(num_layers)])
         self.out_norm = RMSNorm()
         self.out_proj = CastedLinear(mamba_dim, model_dim, bias=False)
         self.out_proj._zero_init = True
@@ -753,7 +813,8 @@ class GPT(nn.Module):
         mamba_dim: int,
         mamba_layers: int,
         mamba_conv_kernel: int,
-        mamba_gate_init: float,
+        mamba_mixer: str = "triton_conv1d",
+        mamba_gate_init: float = -3.0,
         train_seq_len: int = 1024,
     ):
         super().__init__()
@@ -787,6 +848,7 @@ class GPT(nn.Module):
             mamba_dim,
             mamba_layers,
             mamba_conv_kernel,
+            mamba_mixer,
         ) if use_mamba_path else None
         self.fusion_gate = nn.Parameter(torch.full((model_dim,), mamba_gate_init, dtype=torch.float32))
         self.final_norm = RMSNorm()
@@ -1072,6 +1134,7 @@ def main() -> None:
         mamba_dim=args.mamba_dim,
         mamba_layers=args.mamba_layers,
         mamba_conv_kernel=args.mamba_conv_kernel,
+        mamba_mixer=args.mamba_mixer,
         mamba_gate_init=args.mamba_gate_init,
         train_seq_len=args.train_seq_len,
     ).to(device).bfloat16()
@@ -1141,7 +1204,8 @@ def main() -> None:
     log0(
         f"architecture:{args.architecture_name} use_mamba_path:{args.use_mamba_path} "
         f"mamba_dim:{args.mamba_dim} mamba_layers:{args.mamba_layers} "
-        f"mamba_conv_kernel:{args.mamba_conv_kernel} estimate_bytes:{DUAL_MAMBA_DEFAULT_ARTIFACT_ESTIMATE_BYTES}"
+        f"mamba_conv_kernel:{args.mamba_conv_kernel} mamba_mixer:{args.mamba_mixer} "
+        f"estimate_bytes:{DUAL_MAMBA_DEFAULT_ARTIFACT_ESTIMATE_BYTES}"
     )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")

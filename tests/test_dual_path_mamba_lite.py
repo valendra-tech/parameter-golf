@@ -24,8 +24,9 @@ class DualPathMambaLiteTest(unittest.TestCase):
         self.assertIn("class MambaLiteBlock", text)
         self.assertIn("class MambaLiteBranch", text)
         self.assertIn('use_mamba_path = bool(int(os.environ.get("USE_MAMBA_PATH", "1")))', text)
-        self.assertIn('mamba_dim = int(os.environ.get("MAMBA_DIM", 112))', text)
-        self.assertIn('mamba_layers = int(os.environ.get("MAMBA_LAYERS", 3))', text)
+        self.assertIn('mamba_dim = int(os.environ.get("MAMBA_DIM", 64))', text)
+        self.assertIn('mamba_layers = int(os.environ.get("MAMBA_LAYERS", 1))', text)
+        self.assertIn('mamba_mixer = os.environ.get("MAMBA_MIXER", "triton_conv1d")', text)
 
     def test_fusion_is_gated_residual_from_transformer_and_mamba_states(self) -> None:
         text = _script_text()
@@ -34,19 +35,26 @@ class DualPathMambaLiteTest(unittest.TestCase):
         self.assertIn("mamba_out = self.mamba_branch(x0)", text)
         self.assertRegex(text, r"x\s*=\s*x\s*\+\s*gate\s*\*\s*mamba_out")
 
+    def test_default_mamba_mixer_uses_triton_kernel_with_conv1d_fallback(self) -> None:
+        text = _script_text()
+        self.assertIn("@triton.jit", text)
+        self.assertIn("class TritonCausalDepthwiseConv1d", text)
+        self.assertIn("def causal_depthwise_conv1d", text)
+        self.assertIn('elif mixer == "triton_conv1d":', text)
+        self.assertIn('if mixer == "conv1d":', text)
+
     def test_default_shape_has_room_under_16mb_artifact_cap(self) -> None:
         text = _script_text()
         match = re.search(r"DUAL_MAMBA_DEFAULT_ARTIFACT_ESTIMATE_BYTES\s*=\s*([0-9_]+)", text)
         self.assertIsNotNone(match, "script should expose a conservative default artifact estimate")
         assert match is not None
         estimate = int(match.group(1).replace("_", ""))
-        mamba_dim = 112
+        mamba_dim = 64
         model_dim = 512
-        layers = 3
-        kernel = 7
+        layers = 1
         branch_payload = (
             2 * model_dim * mamba_dim * 2
-            + layers * ((mamba_dim * 2 * mamba_dim * 2) + (mamba_dim * mamba_dim * 2) + (mamba_dim * kernel * 2) + (3 * mamba_dim * 2))
+            + layers * ((2 * mamba_dim * mamba_dim * 2) + (mamba_dim * mamba_dim * 2) + (mamba_dim * 7 * 2) + (3 * mamba_dim * 2))
             + model_dim * 2
         )
         static_estimate = BASE_ARTIFACT_BYTES + (SCRIPT.stat().st_size - BASE_CODE_BYTES) + branch_payload

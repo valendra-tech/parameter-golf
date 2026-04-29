@@ -8,8 +8,9 @@
   "defaults": {
     "num_layers": 10,
     "model_dim": 512,
-    "mamba_dim": 112,
-    "mamba_layers": 3,
+    "mamba_dim": 64,
+    "mamba_layers": 1,
+    "mamba_mixer": "triton_conv1d",
     "mamba_conv_kernel": 7,
     "use_mamba_path": true
   },
